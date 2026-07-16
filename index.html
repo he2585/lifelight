@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#FAF8F3">
+  <title>日子有微光</title>
+  <script type="module" crossorigin src="/assets/index-B3ufZz0o.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-CAaIIymV.css">
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <button id="profile-btn" class="profile-btn" aria-label="个人资料">
+        <span class="profile-avatar" id="profile-avatar"></span>
+        <span class="profile-name" id="profile-name"></span>
+      </button>
+      <div id="topbar-title"></div>
+      <div id="search-box" hidden>
+        <input type="search" id="search-input" placeholder="搜索书名 / 作者 / 笔记" autocomplete="off">
+        <button type="button" id="search-clear" class="search-clear" aria-label="清除">×</button>
+      </div>
+      <button id="filter-btn" class="icon-btn" hidden>筛选</button>
+    </header>
+
+    <main id="view">
+      <!-- Tab 1 书架 -->
+      <section id="view-shelf" class="view active">
+        <div id="shelf-top"></div>
+        <div id="shelf-grid"></div>
+        <div id="shelf-empty" hidden></div>
+        <button id="fab-add" class="fab" aria-label="新增">+</button>
+      </section>
+      <!-- Tab 2 统计 -->
+      <section id="view-stats" class="view"></section>
+      <!-- Tab 3 设置 -->
+      <section id="view-settings" class="view"></section>
+    </main>
+
+    <!-- 全屏覆盖层：新增 / 编辑 / 详情 -->
+    <div id="modal" class="modal" hidden>
+      <div id="modal-card" class="modal-card"></div>
+    </div>
+
+    <nav id="tabs">
+      <button class="tab" data-tab="shelf">📚<span>书架</span></button>
+      <button class="tab" data-tab="stats">📊<span>统计</span></button>
+      <button class="tab" data-tab="settings">⚙<span>我的</span></button>
+    </nav>
+
+    <div id="toast" class="toast" hidden></div>
+  </div>
+
+  <div id="app-loader" hidden>
+    <div class="loader-spinner"></div>
+    <div class="loader-text" id="loader-text">连接云端…</div>
+  </div>
+</head>
+
+</body>
+</html>
