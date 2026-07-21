@@ -10,7 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@cloudbase/js-sdk": "^3.6.2",
     "vite": "^8.1.4"
   }
 }

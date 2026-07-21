@@ -1,209 +1,24 @@
 // =============================================
-// 0. 入口：src/main.js（vite 入口）
+// 0. 入口：src/main.js
 // =============================================
 import './styles.css';
-import cloudbase from '@cloudbase/js-sdk';
+import {
+  putBook, getBook, deleteBook, listBooks,
+  saveCoverBlob, getCoverUrl,
+  loadProfile, saveProfile,
+  clearAll,
+} from './lib/storage.js';
 
 // =============================================
-// 1. 常量与配置
+// 1. 常量
 // =============================================
-const TCB_ENV_ID = 'lifelight-d8gqa6nbcf8db37c6';
-const COLLECTION = 'lifelight';
 const POSTER_W = 1080;
 const POSTER_H = 1440;
 
-// =============================================
-// 2. CloudBase 初始化
-// =============================================
-let _tcbApp = null;
-let _tcbReady = null;
-
-async function initCloud() {
-  if (_tcbReady) return _tcbReady;
-  _tcbReady = (async () => {
-    const app = cloudbase.init({
-      env: TCB_ENV_ID,
-      region: 'ap-shanghai',  // v3 必须指定地域
-    });
-    // 强制清掉之前残留的失败缓存
-    try { await app.auth.signOut(); } catch {}
-    await app.auth.signInAnonymously();
-    _tcbApp = app;
-  })();
-  return _tcbReady;
-}
-
-function db() {
-  if (!_tcbApp) { throw new Error('CloudBase 未初始化'); }
-  return _tcbApp.database();
-}
-
-// =============================================
-// 3. 数据访问层（UI 调这些函数；不再直接调 IDB）
-// =============================================
-
-// 把书存进去（book 包含 coverFileID）。返回 _id
-async function putBook(book) {
-  await initCloud();
-  const { _id, ...payload } = book;
-  if (_id) {
-    await db().collection(COLLECTION).doc(_id).update({ data: payload });
-    return _id;
-  }
-  const res = await db().collection(COLLECTION).add({
-    data: { ...payload, type: 'book' },
-  });
-  return res._id || res.id;
-}
-
-async function getBook(id) {
-  await initCloud();
-  const res = await db().collection(COLLECTION).doc(id).get();
-  const arr = res.data || [];
-  const raw = arr[0];
-  if (!raw) return null;
-  return { _id: raw._id, ...(raw.data || raw) };
-}
-
-async function deleteBook(id) {
-  await initCloud();
-  await db().collection(COLLECTION).doc(id).remove();
-}
-
-async function listBooks() {
-  await initCloud();
-  // 直接拉所有，前端过滤（避免 SDK 对 data.* 字段路径的歧义）
-  const res = await db().collection(COLLECTION).get();
-  const arr = res.data || [];
-  const out = [];
-  for (let i = 0; i < arr.length; i++) {
-    const doc = arr[i];
-    const dataFields = doc.data || doc;
-    if (dataFields.type === 'book') {
-      out.push({
-        _id: doc._id,
-        title: dataFields.title,
-        author: dataFields.author,
-        readDate: dataFields.readDate,
-        note: dataFields.note,
-        favorite: !!dataFields.favorite,
-        tags: dataFields.tags,
-        coverFileID: dataFields.coverFileID,
-      });
-    }
-  }
-  return out.sort(function(a, b) {
-    return (b.readDate || '').localeCompare(a.readDate || '');
-  });
-}
-
-async function clearAll() {
-  await initCloud();
-  const res = await db().collection(COLLECTION).where({ 'data.type': 'book' }).get();
-  await Promise.all((res.data || []).map(b => db().collection(COLLECTION).doc(b._id).remove()));
-  const prof = await db().collection(COLLECTION).where({ 'data.type': 'profile' }).get();
-  await Promise.all((prof.data || []).map(p => db().collection(COLLECTION).doc(p._id).remove()));
-}
-
-// 个人资料：profile 用同一集合，type='profile' 单文档
-const PROFILE_DEFAULT = { avatarFileID: null, nickname: '日子有微光' };
 let _profileCache = null;
 
-async function loadProfile() {
-  if (_profileCache) return _profileCache;
-  await initCloud();
-  const res = await db().collection(COLLECTION).where({ 'data.type': 'profile' }).limit(1).get();
-  const p = res.data && res.data[0];
-  if (p) {
-    const profileData = p.data || p;
-    _profileCache = {
-      avatar: profileData.avatarDataUrl || null,
-      avatarDataUrl: profileData.avatarDataUrl || null,
-      avatarFileID: profileData.avatarFileID || null,
-      nickname: profileData.nickname || PROFILE_DEFAULT.nickname,
-    };
-  } else {
-    _profileCache = { ...PROFILE_DEFAULT };
-  }
-  return _profileCache;
-}
-
-async function saveProfile(p) {
-  await initCloud();
-  const data = {
-    type: 'profile',
-    nickname: p.nickname,
-    avatarFileID: p.avatarFileID || null,
-  };
-  const existing = await db().collection(COLLECTION).where({ 'data.type': 'profile' }).limit(1).get();
-  if (existing.data && existing.data[0]) {
-    await db().collection(COLLECTION).doc(existing.data[0]._id).update({ data });
-  } else {
-    await db().collection(COLLECTION).add({ data });
-  }
-  _profileCache = { ...p };
-}
-
-function profileSync() {
-  // 给 UI 用的同步接口（启动时已加载过 profile 之后才安全）
-  return _profileCache || { ...PROFILE_DEFAULT };
-}
-
 // =============================================
-// 4. 云存储：上传 / 临时 URL
-// =============================================
-const _fileUrlCache = new Map();
-
-async function uploadBookCoverToCloud(blob, name) {
-  await initCloud();
-  const ext = (blob.type || 'image/jpeg').split('/')[1] || 'jpg';
-  const fName = name || `file-${Date.now()}.${ext}`;
-  const cPath = `lifelight/${fName}`;
-  const fObj = new File([blob], fName, { type: blob.type || 'image/jpeg' });
-  const resp = await _tcbApp.uploadFile({ cloudPath: cPath, filePath: fObj });
-  return resp.fileID;
-}
-
-async function fileIdToUrl(fileID) {
-  if (!fileID) return null;
-  const cached = _fileUrlCache.get(fileID);
-  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.url;
-  await initCloud();
-  // v3：getTempFileURL 接受 fileID 数组
-  const res = await _tcbApp.getTempFileURL({ fileList: [fileID] });
-  const item = (res.fileList || [])[0];
-  if (!item || !item.tempFileURL) return null;
-  _fileUrlCache.set(fileID, { url: item.tempFileURL, expiresAt: Date.now() + 50 * 60 * 1000 });
-  return item.tempFileURL;
-}
-
-// UI 用的：拿一本书的封面 URL（异步）
-async function bookCoverUrl(book) {
-  if (!book) return '';
-  if (book.coverFileID) return (await fileIdToUrl(book.coverFileID)) || '';
-  return '';
-}
-
-// =============================================
-// 5. 头像 dataURL（个人资料头像走 DataURL，不上云）
-// =============================================
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(blob);
-  });
-}
-
-async function profileAvatarUrl() {
-  const p = profileSync();
-  if (!p.avatarDataUrl) return null;
-  return p.avatarDataUrl;
-}
-
-// =============================================
-// 6. 图片工具（压缩）
+// 2. 图片工具（压缩）
 // =============================================
 const MAX_LONG_EDGE = 800;
 const JPEG_QUALITY = 0.7;
@@ -236,18 +51,8 @@ function compressImage(file) {
   });
 }
 
-function blobToImage(blob) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('image load failed'));
-    img.src = url;
-  });
-}
-
 // =============================================
-// 7. 工具函数
+// 3. 工具函数
 // =============================================
 function showToast(msg, duration = 1800) {
   const t = document.getElementById('toast');
@@ -277,21 +82,25 @@ function profileInitials(name) {
 }
 
 // =============================================
-// 8. 个人资料 chip + 编辑
+// 4. 个人资料
 // =============================================
 async function renderProfileChip() {
-  const p = await loadProfile();
+  _profileCache = await loadProfile();
   const avatarEl = document.getElementById('profile-avatar');
   const nameEl = document.getElementById('profile-name');
   if (!avatarEl || !nameEl) return;
-  if (p.avatarDataUrl) {
-    avatarEl.style.backgroundImage = `url(${p.avatarDataUrl})`;
+  if (_profileCache.avatarDataUrl) {
+    avatarEl.style.backgroundImage = `url(${_profileCache.avatarDataUrl})`;
     avatarEl.textContent = '';
   } else {
     avatarEl.style.backgroundImage = '';
-    avatarEl.textContent = profileInitials(p.nickname);
+    avatarEl.textContent = profileInitials(_profileCache.nickname);
   }
-  nameEl.textContent = p.nickname;
+  nameEl.textContent = _profileCache.nickname;
+}
+
+function profileSync() {
+  return _profileCache || { nickname: '日子有微光', avatarDataUrl: null };
 }
 
 function openProfileEditor() {
@@ -324,7 +133,6 @@ function openProfileEditor() {
     const file = ev.target.files?.[0];
     if (!file) return;
     try {
-      // 头像压缩到 200px / 0.85
       const blob = await compressImage(file);
       const url = URL.createObjectURL(blob);
       const img = new Image();
@@ -371,8 +179,17 @@ function closeProfile() {
   document.getElementById('modal').hidden = true;
 }
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
 // =============================================
-// 9. 视图：书架
+// 5. 视图：书架
 // =============================================
 const filter = {
   month: 'all',
@@ -387,6 +204,7 @@ async function renderShelf() {
   const top = document.getElementById('shelf-top');
   const grid = document.getElementById('shelf-grid');
   const empty = document.getElementById('shelf-empty');
+  const listContainer = document.getElementById('list-container');
 
   document.getElementById('filter-btn').hidden = false;
   document.getElementById('search-box').hidden = false;
@@ -395,11 +213,7 @@ async function renderShelf() {
   try {
     books = await listBooks();
   } catch (err) {
-    const dbg = document.createElement('div');
-    dbg.id = '__debug_listbooks';
-    dbg.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#c00;color:#fff;padding:8px;font-size:11px;z-index:99999;font-family:monospace;';
-    dbg.textContent = '加载失败: ' + (err.message || String(err));
-    document.body.appendChild(dbg);
+    showToast('加载失败：' + (err.message || err));
     return;
   }
 
@@ -431,13 +245,12 @@ async function renderShelf() {
     return filter.sort === 'newest' ? -cmp : cmp;
   });
 
-  const listEl = document.getElementById('shelf-list');
-  if (!listEl) {
+  if (!listContainer) {
     const el = document.createElement('div');
-    el.id = 'shelf-list';
+    el.id = 'list-container';
     document.getElementById('view-shelf').insertBefore(el, document.getElementById('fab-add'));
   }
-  const list = document.getElementById('shelf-list');
+  const list = document.getElementById('list-container');
   grid.style.display = filter.view === 'grid' ? '' : 'none';
   list.style.display = filter.view === 'list' ? '' : 'none';
 
@@ -475,7 +288,7 @@ async function makeBookCard(book) {
   const card = document.createElement('div');
   card.className = 'book-card';
   const img = document.createElement('img');
-  const coverSrc = await bookCoverUrl(book);
+  const coverSrc = await getCoverUrl(book.coverBlobKey);
   if (coverSrc) img.src = coverSrc;
   card.appendChild(img);
   const info = document.createElement('div');
@@ -495,7 +308,7 @@ async function makeBookRow(book) {
   const row = document.createElement('div');
   row.className = 'book-row';
   const img = document.createElement('img');
-  const coverSrc = await bookCoverUrl(book);
+  const coverSrc = await getCoverUrl(book.coverBlobKey);
   if (coverSrc) img.src = coverSrc;
   row.appendChild(img);
   const info = document.createElement('div');
@@ -593,7 +406,7 @@ function openFilterSheet() {
 }
 
 // =============================================
-// 10. 视图：统计
+// 6. 视图：统计
 // =============================================
 async function renderStats() {
   const el = document.getElementById('view-stats');
@@ -648,7 +461,7 @@ async function renderStats() {
 
   const recent = [...books].sort((a, b) => (b.readDate || '').localeCompare(a.readDate || '')).slice(0, 5);
   const recentHtml = (await Promise.all(recent.map(async b => {
-    const url = await bookCoverUrl(b);
+    const url = await getCoverUrl(b.coverBlobKey);
     return `
       <div class="recent-item" data-id="${b._id}">
         <img src="${url || ''}">
@@ -688,7 +501,7 @@ async function renderStats() {
 }
 
 // =============================================
-// 11. 视图：设置
+// 7. 视图：设置
 // =============================================
 function renderSettings() {
   const el = document.getElementById('view-settings');
@@ -705,18 +518,28 @@ function renderSettings() {
         <span class="label">导出 PDF（按日期/标签筛选）</span>
         <span class="hint">打印</span>
       </button>
+      <button class="settings-item" id="set-export-json">
+        <span class="label">导出 JSON 备份</span>
+        <span class="hint">下载</span>
+      </button>
+      <button class="settings-item" id="set-import-json">
+        <span class="label">导入 JSON 备份</span>
+        <span class="hint">上传</span>
+      </button>
       <button class="settings-item danger" id="set-clear">
         <span class="label">清空全部数据</span>
       </button>
     </div>
     <p class="about-text">
       日子有微光<br>
-      云端同步 · 跨设备可用
+      数据本地存储 · 导出可迁移
     </p>
   `;
 
   document.getElementById('set-profile').onclick = openProfileEditor;
   document.getElementById('set-export-pdf').onclick = openExportPdfSheet;
+  document.getElementById('set-export-json').onclick = exportJsonBackup;
+  document.getElementById('set-import-json').onclick = importJsonBackup;
   document.getElementById('set-clear').onclick = clearAllFlow;
 }
 
@@ -732,7 +555,57 @@ async function clearAllFlow() {
 }
 
 // =============================================
-// 12. PDF 导出
+// 7b. JSON 备份
+// =============================================
+async function exportJsonBackup() {
+  try {
+    const books = await listBooks();
+    const profile = await loadProfile();
+    const data = { version: 1, exportedAt: new Date().toISOString(), books, profile };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `日子有微光-备份-${todayStr()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    showToast('已下载备份文件');
+  } catch (err) {
+    showToast('导出失败：' + (err.message || err));
+  }
+}
+
+async function importJsonBackup() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json';
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!data.books || !Array.isArray(data.books)) {
+        showToast('备份文件格式不正确');
+        return;
+      }
+      if (!confirm(`将导入 ${data.books.length} 本书的记录，是否继续？`)) return;
+      for (const book of data.books) {
+        await putBook(book);
+      }
+      if (data.profile) {
+        await saveProfile(data.profile);
+      }
+      showToast('导入成功');
+      renderShelf();
+    } catch (err) {
+      showToast('导入失败：' + (err.message || err));
+    }
+  };
+  input.click();
+}
+
+// =============================================
+// 8. PDF 导出
 // =============================================
 async function openExportPdfSheet() {
   document.getElementById('filter-sheet')?.remove();
@@ -798,11 +671,10 @@ async function openExportPdfSheet() {
 
 async function openPdfPrintWindow(books, monthLabel) {
   const profile = await loadProfile();
-  // 把每本书的封面转成 dataURL（pdf 新窗口里直接用 img）
   const enriched = await Promise.all(books.map(async b => {
     let coverUrl = '';
-    if (b.coverFileID) {
-      coverUrl = await fileIdToUrl(b.coverFileID) || '';
+    if (b.coverBlobKey) {
+      coverUrl = await getCoverUrl(b.coverBlobKey) || '';
     }
     return { ...b, coverUrl };
   }));
@@ -885,13 +757,13 @@ function buildPrintHtml(books, profile, monthLabel) {
 }
 
 // =============================================
-// 13. 视图：详情
+// 9. 视图：详情
 // =============================================
 async function openDetail(id) {
   const book = await getBook(id);
   if (!book) { showToast('记录不存在'); return; }
   const card = document.getElementById('modal-card');
-  const coverUrl = await bookCoverUrl(book);
+  const coverUrl = await getCoverUrl(book.coverBlobKey);
   card.innerHTML = `
     <button class="modal-close" id="detail-close">×</button>
     <img class="detail-cover" src="${coverUrl || ''}">
@@ -936,10 +808,10 @@ async function deleteBookFlow(id) {
 }
 
 // =============================================
-// 14. 海报
+// 10. 海报
 // =============================================
 async function drawPoster(book) {
-  const coverUrl = await bookCoverUrl(book);
+  const coverUrl = await getCoverUrl(book.coverBlobKey);
   if (!coverUrl) return null;
   const c = document.createElement('canvas');
   c.width = POSTER_W;
@@ -1068,15 +940,15 @@ async function openPoster(book) {
 }
 
 // =============================================
-// 15. 视图：新增 / 编辑表单
+// 11. 视图：新增 / 编辑表单
 // =============================================
 let _editingBook = null;
-let _formCoverFileID = null;
+let _formCoverBlob = null;
 let _formTags = [];
 
 function openForm(book = null) {
   _editingBook = book;
-  _formCoverFileID = null;
+  _formCoverBlob = null;
   _formTags = [];
   const card = document.getElementById('modal-card');
   const isEdit = !!book;
@@ -1133,11 +1005,9 @@ function openForm(book = null) {
       renderFormTags();
     }
     if (book.favorite) toggleFav(true);
-    if (book.coverFileID) {
-      _formCoverFileID = book.coverFileID;
-      // 异步加载预览
+    if (book.coverBlobKey) {
       (async () => {
-        const url = await fileIdToUrl(book.coverFileID);
+        const url = await getCoverUrl(book.coverBlobKey);
         if (url) showCoverPreview(url);
       })();
     }
@@ -1221,7 +1091,7 @@ async function renderTagSuggest() {
 function closeForm() {
   document.getElementById('modal').hidden = true;
   _editingBook = null;
-  _formCoverFileID = null;
+  _formCoverBlob = null;
   _formTags = [];
 }
 
@@ -1229,14 +1099,13 @@ async function handleCoverChange(e) {
   const file = e.target.files?.[0];
   if (!file) return;
   try {
-    showCoverPreview(null, '上传中…');
+    showCoverPreview(null, '处理中…');
     const compressed = await compressImage(file);
-    const fid = await uploadBookCoverToCloud(compressed, `cover-${Date.now()}.jpg`);
-    _formCoverFileID = fid;
-    const previewUrl = await fileIdToUrl(fid);
+    _formCoverBlob = compressed;
+    const previewUrl = URL.createObjectURL(compressed);
     showCoverPreview(previewUrl);
   } catch (err) {
-    showToast('上传失败：' + (err.message || err));
+    showToast('图片处理失败：' + (err.message || err));
     const picker = document.getElementById('cover-picker');
     picker.classList.remove('has-cover');
     picker.querySelector('img')?.remove();
@@ -1294,15 +1163,22 @@ async function saveForm() {
   const tags = _formTags.slice();
 
   if (!title) { showToast('书名必填'); return; }
-  if (!_editingBook && !_formCoverFileID) { showToast('请上传封面'); return; }
+  if (!_editingBook && !_formCoverBlob) { showToast('请上传封面'); return; }
 
-  const coverFileID = _formCoverFileID || (_editingBook && _editingBook.coverFileID);
   const book = {
-    title, author, readDate, note, favorite, tags, coverFileID,
+    title, author, readDate, note, favorite, tags,
   };
   if (_editingBook && _editingBook._id) book._id = _editingBook._id;
 
   try {
+    // 保存封面 Blob
+    if (_formCoverBlob) {
+      const blobKey = await saveCoverBlob(_formCoverBlob);
+      book.coverBlobKey = blobKey;
+    } else if (_editingBook && _editingBook.coverBlobKey) {
+      book.coverBlobKey = _editingBook.coverBlobKey;
+    }
+
     const savedId = await putBook(book);
     console.log('[saveForm] saved id =', savedId);
     closeForm();
@@ -1314,7 +1190,7 @@ async function saveForm() {
 }
 
 // =============================================
-// 16. 入口：DOMContentLoaded
+// 12. 入口
 // =============================================
 document.addEventListener('DOMContentLoaded', async () => {
   // Tab 切换
@@ -1354,23 +1230,18 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('profile-btn').onclick = openProfileEditor;
 
-  // 初始化 CloudBase：登录 + 加载 profile
-  const loader = document.getElementById('app-loader');
-  const loaderText = loader.querySelector('.loader-text');
+  // 初始化：加载 profile + 渲染
   try {
-    loaderText.textContent = '连接云端…';
-    await initCloud();
-    await loadProfile();
-    loader.hidden = true;
-    document.getElementById('app').hidden = false;
     await renderProfileChip();
-    // 首次渲染书架
-    // 等 DOM 绑定完成后再异步触发
-    // （先直接 await 渲染）
+    document.getElementById('app').hidden = false;
+    document.getElementById('app-loader').hidden = true;
     renderShelf();
   } catch (err) {
-    loaderText.innerHTML = (err.message || err).replace(/\n/g, '<br>');
-    loader.style.color = '#c33';
-    console.error('CloudBase init failed:', err);
+    const loaderText = document.querySelector('#app-loader .loader-text');
+    if (loaderText) {
+      loaderText.innerHTML = (err.message || err).replace(/\n/g, '<br>');
+      loaderText.style.color = '#c33';
+    }
+    console.error('Init failed:', err);
   }
 });
