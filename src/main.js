@@ -3,10 +3,12 @@
 // =============================================
 import './styles.css';
 import {
-  putBook, getBook, deleteBook, listBooks,
-  saveCoverBlob, getCoverUrl,
-  loadProfile, saveProfile,
-  clearAll,
+  putBook, getBook, deleteBook, listBooks, clearAll,
+  uploadCover, getCoverUrl,
+  compressImage,
+  loadProfile, saveProfile, profileSync,
+  exportBooks, importBooks,
+  initCloud,
 } from './lib/storage.js';
 
 // =============================================
@@ -15,44 +17,8 @@ import {
 const POSTER_W = 1080;
 const POSTER_H = 1440;
 
-let _profileCache = null;
-
 // =============================================
-// 2. 图片工具（压缩）
-// =============================================
-const MAX_LONG_EDGE = 800;
-const JPEG_QUALITY = 0.7;
-
-function compressImage(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const w0 = img.width, h0 = img.height;
-        const longEdge = Math.max(w0, h0);
-        const scale = longEdge > MAX_LONG_EDGE ? MAX_LONG_EDGE / longEdge : 1;
-        const w = Math.round(w0 * scale);
-        const h = Math.round(h0 * scale);
-        const c = document.createElement('canvas');
-        c.width = w; c.height = h;
-        const ctx = c.getContext('2d');
-        ctx.drawImage(img, 0, 0, w, h);
-        c.toBlob(
-          blob => blob ? resolve(blob) : reject(new Error('toBlob failed')),
-          'image/jpeg', JPEG_QUALITY
-        );
-      };
-      img.onerror = () => reject(new Error('image load failed'));
-      img.src = reader.result;
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
-
-// =============================================
-// 3. 工具函数
+// 2. 工具函数
 // =============================================
 function showToast(msg, duration = 1800) {
   const t = document.getElementById('toast');
@@ -81,26 +47,31 @@ function profileInitials(name) {
   return s ? s[0] : '微';
 }
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
 // =============================================
-// 4. 个人资料
+// 3. 个人资料
 // =============================================
 async function renderProfileChip() {
-  _profileCache = await loadProfile();
+  const p = await loadProfile();
   const avatarEl = document.getElementById('profile-avatar');
   const nameEl = document.getElementById('profile-name');
   if (!avatarEl || !nameEl) return;
-  if (_profileCache.avatarDataUrl) {
-    avatarEl.style.backgroundImage = `url(${_profileCache.avatarDataUrl})`;
+  if (p.avatarDataUrl) {
+    avatarEl.style.backgroundImage = `url(${p.avatarDataUrl})`;
     avatarEl.textContent = '';
   } else {
     avatarEl.style.backgroundImage = '';
-    avatarEl.textContent = profileInitials(_profileCache.nickname);
+    avatarEl.textContent = profileInitials(p.nickname);
   }
-  nameEl.textContent = _profileCache.nickname;
-}
-
-function profileSync() {
-  return _profileCache || { nickname: '日子有微光', avatarDataUrl: null };
+  nameEl.textContent = p.nickname;
 }
 
 function openProfileEditor() {
@@ -179,17 +150,8 @@ function closeProfile() {
   document.getElementById('modal').hidden = true;
 }
 
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(blob);
-  });
-}
-
 // =============================================
-// 5. 视图：书架
+// 4. 视图：书架
 // =============================================
 const filter = {
   month: 'all',
@@ -204,7 +166,6 @@ async function renderShelf() {
   const top = document.getElementById('shelf-top');
   const grid = document.getElementById('shelf-grid');
   const empty = document.getElementById('shelf-empty');
-  const listContainer = document.getElementById('list-container');
 
   document.getElementById('filter-btn').hidden = false;
   document.getElementById('search-box').hidden = false;
@@ -213,7 +174,11 @@ async function renderShelf() {
   try {
     books = await listBooks();
   } catch (err) {
-    showToast('加载失败：' + (err.message || err));
+    const dbg = document.createElement('div');
+    dbg.id = '__debug_listbooks';
+    dbg.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#c00;color:#fff;padding:8px;font-size:11px;z-index:99999;font-family:monospace;';
+    dbg.textContent = '加载失败: ' + (err.message || String(err));
+    document.body.appendChild(dbg);
     return;
   }
 
@@ -245,12 +210,13 @@ async function renderShelf() {
     return filter.sort === 'newest' ? -cmp : cmp;
   });
 
-  if (!listContainer) {
+  const listEl = document.getElementById('shelf-list');
+  if (!listEl) {
     const el = document.createElement('div');
-    el.id = 'list-container';
+    el.id = 'shelf-list';
     document.getElementById('view-shelf').insertBefore(el, document.getElementById('fab-add'));
   }
-  const list = document.getElementById('list-container');
+  const list = document.getElementById('shelf-list');
   grid.style.display = filter.view === 'grid' ? '' : 'none';
   list.style.display = filter.view === 'list' ? '' : 'none';
 
@@ -284,11 +250,16 @@ function tagPillsHtml(book) {
   return `<div class="tag-pills-row">${book.tags.map(t => `<span class="tag-pill-static">${escapeHtml(t)}</span>`).join('')}</div>`;
 }
 
+async function bookCoverForCard(book) {
+  if (!book.cover) return '';
+  return await getCoverUrl(book.cover) || '';
+}
+
 async function makeBookCard(book) {
   const card = document.createElement('div');
   card.className = 'book-card';
   const img = document.createElement('img');
-  const coverSrc = await getCoverUrl(book.coverBlobKey);
+  const coverSrc = await bookCoverForCard(book);
   if (coverSrc) img.src = coverSrc;
   card.appendChild(img);
   const info = document.createElement('div');
@@ -308,7 +279,7 @@ async function makeBookRow(book) {
   const row = document.createElement('div');
   row.className = 'book-row';
   const img = document.createElement('img');
-  const coverSrc = await getCoverUrl(book.coverBlobKey);
+  const coverSrc = await bookCoverForCard(book);
   if (coverSrc) img.src = coverSrc;
   row.appendChild(img);
   const info = document.createElement('div');
@@ -406,7 +377,7 @@ function openFilterSheet() {
 }
 
 // =============================================
-// 6. 视图：统计
+// 5. 视图：统计
 // =============================================
 async function renderStats() {
   const el = document.getElementById('view-stats');
@@ -461,7 +432,7 @@ async function renderStats() {
 
   const recent = [...books].sort((a, b) => (b.readDate || '').localeCompare(a.readDate || '')).slice(0, 5);
   const recentHtml = (await Promise.all(recent.map(async b => {
-    const url = await getCoverUrl(b.coverBlobKey);
+    const url = await bookCoverForCard(b);
     return `
       <div class="recent-item" data-id="${b._id}">
         <img src="${url || ''}">
@@ -501,7 +472,7 @@ async function renderStats() {
 }
 
 // =============================================
-// 7. 视图：设置
+// 6. 视图：设置
 // =============================================
 function renderSettings() {
   const el = document.getElementById('view-settings');
@@ -532,14 +503,14 @@ function renderSettings() {
     </div>
     <p class="about-text">
       日子有微光<br>
-      数据本地存储 · 导出可迁移
+      云端同步 · 跨设备可用
     </p>
   `;
 
   document.getElementById('set-profile').onclick = openProfileEditor;
   document.getElementById('set-export-pdf').onclick = openExportPdfSheet;
-  document.getElementById('set-export-json').onclick = exportJsonBackup;
-  document.getElementById('set-import-json').onclick = importJsonBackup;
+  document.getElementById('set-export-json').onclick = handleExportJson;
+  document.getElementById('set-import-json').onclick = handleImportJson;
   document.getElementById('set-clear').onclick = clearAllFlow;
 }
 
@@ -554,14 +525,9 @@ async function clearAllFlow() {
   }
 }
 
-// =============================================
-// 7b. JSON 备份
-// =============================================
-async function exportJsonBackup() {
+async function handleExportJson() {
   try {
-    const books = await listBooks();
-    const profile = await loadProfile();
-    const data = { version: 1, exportedAt: new Date().toISOString(), books, profile };
+    const data = await exportBooks();
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -574,7 +540,7 @@ async function exportJsonBackup() {
   }
 }
 
-async function importJsonBackup() {
+async function handleImportJson() {
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = '.json';
@@ -589,12 +555,7 @@ async function importJsonBackup() {
         return;
       }
       if (!confirm(`将导入 ${data.books.length} 本书的记录，是否继续？`)) return;
-      for (const book of data.books) {
-        await putBook(book);
-      }
-      if (data.profile) {
-        await saveProfile(data.profile);
-      }
+      await importBooks(data);
       showToast('导入成功');
       renderShelf();
     } catch (err) {
@@ -605,7 +566,7 @@ async function importJsonBackup() {
 }
 
 // =============================================
-// 8. PDF 导出
+// 7. PDF 导出
 // =============================================
 async function openExportPdfSheet() {
   document.getElementById('filter-sheet')?.remove();
@@ -670,12 +631,10 @@ async function openExportPdfSheet() {
 }
 
 async function openPdfPrintWindow(books, monthLabel) {
-  const profile = await loadProfile();
+  const profile = profileSync();
   const enriched = await Promise.all(books.map(async b => {
     let coverUrl = '';
-    if (b.coverBlobKey) {
-      coverUrl = await getCoverUrl(b.coverBlobKey) || '';
-    }
+    if (b.cover) coverUrl = await getCoverUrl(b.cover) || '';
     return { ...b, coverUrl };
   }));
   const html = buildPrintHtml(enriched, profile, monthLabel);
@@ -757,13 +716,13 @@ function buildPrintHtml(books, profile, monthLabel) {
 }
 
 // =============================================
-// 9. 视图：详情
+// 8. 视图：详情
 // =============================================
 async function openDetail(id) {
   const book = await getBook(id);
   if (!book) { showToast('记录不存在'); return; }
   const card = document.getElementById('modal-card');
-  const coverUrl = await getCoverUrl(book.coverBlobKey);
+  const coverUrl = await getCoverUrl(book.cover);
   card.innerHTML = `
     <button class="modal-close" id="detail-close">×</button>
     <img class="detail-cover" src="${coverUrl || ''}">
@@ -808,10 +767,10 @@ async function deleteBookFlow(id) {
 }
 
 // =============================================
-// 10. 海报
+// 9. 海报
 // =============================================
 async function drawPoster(book) {
-  const coverUrl = await getCoverUrl(book.coverBlobKey);
+  const coverUrl = await getCoverUrl(book.cover);
   if (!coverUrl) return null;
   const c = document.createElement('canvas');
   c.width = POSTER_W;
@@ -940,15 +899,17 @@ async function openPoster(book) {
 }
 
 // =============================================
-// 11. 视图：新增 / 编辑表单
+// 10. 视图：新增 / 编辑表单
 // =============================================
 let _editingBook = null;
 let _formCoverBlob = null;
+let _formCoverResult = null;
 let _formTags = [];
 
 function openForm(book = null) {
   _editingBook = book;
   _formCoverBlob = null;
+  _formCoverResult = null;
   _formTags = [];
   const card = document.getElementById('modal-card');
   const isEdit = !!book;
@@ -1005,9 +966,9 @@ function openForm(book = null) {
       renderFormTags();
     }
     if (book.favorite) toggleFav(true);
-    if (book.coverBlobKey) {
+    if (book.cover && book.cover.fileID) {
       (async () => {
-        const url = await getCoverUrl(book.coverBlobKey);
+        const url = await getCoverUrl(book.cover);
         if (url) showCoverPreview(url);
       })();
     }
@@ -1092,6 +1053,7 @@ function closeForm() {
   document.getElementById('modal').hidden = true;
   _editingBook = null;
   _formCoverBlob = null;
+  _formCoverResult = null;
   _formTags = [];
 }
 
@@ -1171,16 +1133,16 @@ async function saveForm() {
   if (_editingBook && _editingBook._id) book._id = _editingBook._id;
 
   try {
-    // 保存封面 Blob
+    // 上传封面（双存）
     if (_formCoverBlob) {
-      const blobKey = await saveCoverBlob(_formCoverBlob);
-      book.coverBlobKey = blobKey;
-    } else if (_editingBook && _editingBook.coverBlobKey) {
-      book.coverBlobKey = _editingBook.coverBlobKey;
+      _formCoverResult = await uploadCover(_formCoverBlob);
+      book.cover = _formCoverResult;
+    } else if (_editingBook && _editingBook.cover) {
+      book.cover = _editingBook.cover;
     }
 
-    const savedId = await putBook(book);
-    console.log('[saveForm] saved id =', savedId);
+    const result = await putBook(book);
+    console.log('[saveForm] saved id =', result._id);
     closeForm();
     renderShelf();
   } catch (err) {
@@ -1190,7 +1152,7 @@ async function saveForm() {
 }
 
 // =============================================
-// 12. 入口
+// 11. 入口
 // =============================================
 document.addEventListener('DOMContentLoaded', async () => {
   // Tab 切换
@@ -1230,18 +1192,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('profile-btn').onclick = openProfileEditor;
 
-  // 初始化：加载 profile + 渲染
+  // 初始化 CloudBase + 加载 profile
+  const loader = document.getElementById('app-loader');
+  const loaderText = loader.querySelector('.loader-text');
   try {
-    await renderProfileChip();
+    loaderText.textContent = '连接云端…';
+    await initCloud();
+    await loadProfile();
+    loader.hidden = true;
     document.getElementById('app').hidden = false;
-    document.getElementById('app-loader').hidden = true;
+    await renderProfileChip();
     renderShelf();
   } catch (err) {
-    const loaderText = document.querySelector('#app-loader .loader-text');
-    if (loaderText) {
-      loaderText.innerHTML = (err.message || err).replace(/\n/g, '<br>');
-      loaderText.style.color = '#c33';
-    }
-    console.error('Init failed:', err);
+    loaderText.innerHTML = (err.message || err).replace(/\n/g, '<br>');
+    loaderText.style.color = '#c33';
+    console.error('CloudBase init failed:', err);
   }
 });
